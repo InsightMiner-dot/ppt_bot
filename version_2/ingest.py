@@ -226,12 +226,22 @@ def _extract_ocr_text(image_blob: bytes, slide_index: int, image_index: int) -> 
         return ""
 
     try:
+        tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip()
+        if tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+        elif os.getenv("TESSERACT_OCR_PATH", "").strip():
+            pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_OCR_PATH", "").strip()
+
         image = Image.open(io.BytesIO(image_blob))
         extracted_text = pytesseract.image_to_string(image)
         cleaned_text = _clean_text(extracted_text)
         if cleaned_text:
             logging.info(
                 f"   -> OCR extracted text for image {image_index} on Slide {slide_index}."
+            )
+        elif tesseract_cmd:
+            logging.info(
+                f"   -> OCR ran with configured Tesseract path for image {image_index} on Slide {slide_index}, but no text was extracted."
             )
         return cleaned_text
     except Exception as exc:
