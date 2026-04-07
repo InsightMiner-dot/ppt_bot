@@ -21,9 +21,20 @@ from scripts import llm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+tesseract_path = r""
+poppler_path = r""
+
 
 def _clean_text(value: str) -> str:
     return " ".join(value.split())
+
+
+def _get_tesseract_cmd() -> str:
+    return tesseract_path.strip()
+
+
+def get_poppler_path() -> str:
+    return poppler_path.strip()
 
 
 def _extract_text_block(value: str) -> str:
@@ -226,11 +237,15 @@ def _extract_ocr_text(image_blob: bytes, slide_index: int, image_index: int) -> 
         return ""
 
     try:
-        tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip()
+        tesseract_cmd = _get_tesseract_cmd()
         if tesseract_cmd:
             pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-        elif os.getenv("TESSERACT_OCR_PATH", "").strip():
-            pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_OCR_PATH", "").strip()
+            logging.info(f"Using Tesseract OCR from: {tesseract_cmd}")
+        else:
+            logging.info(
+                "No Tesseract path configured. Set the 'tesseract_path = r\"...\"' variable in ingest.py."
+            )
+            return ""
 
         image = Image.open(io.BytesIO(image_blob))
         extracted_text = pytesseract.image_to_string(image)
