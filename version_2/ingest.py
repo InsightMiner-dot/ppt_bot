@@ -1,7 +1,4 @@
-import base64
 import glob
-import hashlib
-import io
 import logging
 import os
 import shutil
@@ -21,26 +18,14 @@ from scripts import llm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-tesseract_path = r""
-poppler_path = r""
-
 
 def _clean_text(value: str) -> str:
     return " ".join(value.split())
 
 
-def _get_tesseract_cmd() -> str:
-    return tesseract_path.strip()
-
-
-def get_poppler_path() -> str:
-    return poppler_path.strip()
-
-
 def _extract_text_block(value: str) -> str:
     lines = [_clean_text(line) for line in value.splitlines()]
-    lines = [line for line in lines if line]
-    return "\n".join(lines)
+    return "\n".join([line for line in lines if line])
 
 
 def _slide_header(filename: str, slide_index: int) -> str:
@@ -56,24 +41,28 @@ def _pick_slide_title(text_blocks: list[str]) -> str:
     return ""
 
 
-def _make_semantic_section_text(
+def _make_document(
+    file_path: str,
     filename: str,
     slide_index: int,
-    slide_title: str,
-    section_name: str,
-    body: str,
-) -> str:
-    parts = [
-        _slide_header(filename, slide_index),
-        f"Content Type: {section_name}",
-    ]
-    if slide_title:
-        parts.append(f"Slide Title: {slide_title}")
-    parts.append(body)
-    return "\n".join(parts)
+    content_type: str,
+    content: str,
+    slide_title: str = "",
+    element_index: int | None = None,
+) -> Document:
+    metadata = {
+        "source": file_path,
+        "filename": filename,
+        "page": str(slide_index),
+        "content_type": content_type,
+        "slide_title": slide_title,
+    }
+    if element_index is not None:
+        metadata["element_index"] = element_index
+    return Document(page_content=content, metadata=metadata)
 
 
-def _build_text_section_documents(
+def _build_text_documents(
     file_path: str,
     filename: str,
     slide_index: int,
@@ -81,18 +70,12 @@ def _build_text_section_documents(
     text_blocks: list[str],
 ) -> list[Document]:
     documents: list[Document] = []
-    if not text_blocks:
-        return documents
-
-    seen_bodies = set()
-
     if slide_title:
-        title_text = _make_semantic_section_text(
-            filename=filename,
-            slide_index=slide_index,
-            slide_title=slide_title,
-            section_name="title",
-            body=f"Title:\n{slide_title}",
+        title_text = (
+            f"{_slide_header(filename, slide_index)}\n"
+            "Content Type: Title\n"
+            f"Slide Title: {slide_title}\n"
+            f"Title:\n{slide_title}"
         )
         documents.append(
             _make_document(
@@ -104,74 +87,31 @@ def _build_text_section_documents(
                 slide_title=slide_title,
             )
         )
-        seen_bodies.add(title_text)
 
     for block_index, block in enumerate(text_blocks, start=1):
         lines = [line.strip() for line in block.splitlines() if line.strip()]
         if not lines:
             continue
 
-        section_type = "text_section"
-        if any("comment" in line.lower() for line in lines):
-            section_type = "comments"
-
-        body = (
+        content_type = "comments" if any("comment" in line.lower() for line in lines) else "text_section"
+        block_text = (
+            f"{_slide_header(filename, slide_index)}\n"
+            f"Content Type: {content_type}\n"
+            f"Slide Title: {slide_title}\n"
             f"Section Index: {block_index}\n"
             + "\n".join(lines)
         )
-        section_text = _make_semantic_section_text(
-            filename=filename,
-            slide_index=slide_index,
-            slide_title=slide_title,
-            section_name=section_type,
-            body=body,
-        )
-        if section_text in seen_bodies:
-            continue
-
         documents.append(
             _make_document(
                 file_path=file_path,
                 filename=filename,
                 slide_index=slide_index,
-                content_type=section_type,
-                content=section_text,
+                content_type=content_type,
+                content=block_text,
                 slide_title=slide_title,
                 element_index=block_index,
             )
         )
-        seen_bodies.add(section_text)
-
-        if section_type != "comments":
-            for line_index, line in enumerate(lines, start=1):
-                if "comment" not in line.lower():
-                    continue
-                comment_window = lines[line_index - 1 : min(line_index + 3, len(lines))]
-                comments_text = _make_semantic_section_text(
-                    filename=filename,
-                    slide_index=slide_index,
-                    slide_title=slide_title,
-                    section_name="comments",
-                    body=(
-                        f"Section Index: {block_index}\n"
-                        "Comment-Focused Text:\n"
-                        + "\n".join(comment_window)
-                    ),
-                )
-                if comments_text in seen_bodies:
-                    continue
-                documents.append(
-                    _make_document(
-                        file_path=file_path,
-                        filename=filename,
-                        slide_index=slide_index,
-                        content_type="comments",
-                        content=comments_text,
-                        slide_title=slide_title,
-                        element_index=block_index * 100 + line_index,
-                    )
-                )
-                seen_bodies.add(comments_text)
 
     return documents
 
@@ -193,8 +133,7 @@ def _extract_chart_text(shape, filename: str, slide_index: int, chart_index: int
 
         category_labels = []
         try:
-            categories = chart.plots[0].categories
-            for category in categories:
+            for category in chart.plots[0].categories:
                 label = _clean_text(str(category.label))
                 if label:
                     category_labels.append(label)
@@ -207,8 +146,8 @@ def _extract_chart_text(shape, filename: str, slide_index: int, chart_index: int
         series_lines = []
         for series in chart.series:
             series_name = _clean_text(getattr(series, "name", "") or "Unnamed Series")
-            points = []
             values = list(series.values)
+            points = []
             for idx, value in enumerate(values):
                 label = category_labels[idx] if idx < len(category_labels) else f"Point {idx + 1}"
                 points.append(f"{label}: {value}")
@@ -217,108 +156,10 @@ def _extract_chart_text(shape, filename: str, slide_index: int, chart_index: int
         if series_lines:
             chart_parts.append("Series Data:\n" + "\n".join(series_lines))
 
-        if len(chart_parts) <= 3:
-            return None
-
-        return "\n".join(chart_parts)
+        return "\n".join(chart_parts) if len(chart_parts) > 3 else None
     except Exception as exc:
         logging.warning(f"Chart extraction failed on slide {slide_index}: {exc}")
         return None
-
-
-def _get_supported_vision_payload(image_blob: bytes, image_ext: str) -> tuple[str, str] | tuple[None, None]:
-    normalized_ext = image_ext.lower().strip(".")
-    mime_type_map = {
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "png": "image/png",
-        "gif": "image/gif",
-        "webp": "image/webp",
-    }
-
-    if normalized_ext in mime_type_map:
-        return base64.b64encode(image_blob).decode("utf-8"), mime_type_map[normalized_ext]
-
-    try:
-        from PIL import Image
-    except ImportError:
-        return None, None
-
-    try:
-        image = Image.open(io.BytesIO(image_blob))
-        converted = io.BytesIO()
-        image.convert("RGB").save(converted, format="PNG")
-        return base64.b64encode(converted.getvalue()).decode("utf-8"), "image/png"
-    except Exception:
-        return None, None
-
-
-def _extract_ocr_text(
-    image_blob: bytes,
-    image_ext: str,
-    slide_index: int,
-    image_index: int,
-) -> str:
-    try:
-        from PIL import Image
-        import pytesseract
-    except ImportError:
-        logging.info(
-            "OCR dependencies not available. Install 'pytesseract' and 'Pillow' to enable OCR."
-        )
-        return ""
-
-    try:
-        tesseract_cmd = _get_tesseract_cmd()
-        if tesseract_cmd:
-            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-            logging.info(f"Using Tesseract OCR from: {tesseract_cmd}")
-        else:
-            logging.info(
-                "No Tesseract path configured. Set the 'tesseract_path = r\"...\"' variable in ingest.py."
-            )
-            return ""
-
-        image = Image.open(io.BytesIO(image_blob))
-        extracted_text = pytesseract.image_to_string(image)
-        cleaned_text = _clean_text(extracted_text)
-        if cleaned_text:
-            logging.info(
-                f"   -> OCR extracted text for image {image_index} on Slide {slide_index}."
-            )
-        elif tesseract_cmd:
-            logging.info(
-                f"   -> OCR ran with configured Tesseract path for image {image_index} on Slide {slide_index}, but no text was extracted."
-            )
-        return cleaned_text
-    except Exception as exc:
-        logging.warning(
-            f"OCR failed for image {image_index} on slide {slide_index} "
-            f"(format: {image_ext or 'unknown'}): {exc}"
-        )
-        return ""
-
-
-def _make_document(
-    file_path: str,
-    filename: str,
-    slide_index: int,
-    content_type: str,
-    content: str,
-    slide_title: str = "",
-    element_index: int | None = None,
-) -> Document:
-    metadata = {
-        "source": file_path,
-        "filename": filename,
-        "page": str(slide_index),
-        "content_type": content_type,
-        "slide_title": slide_title,
-    }
-    if element_index is not None:
-        metadata["element_index"] = element_index
-
-    return Document(page_content=content, metadata=metadata)
 
 
 def build_vector_database():
@@ -342,11 +183,8 @@ def build_vector_database():
                 text_blocks = []
                 table_blocks = []
                 chart_blocks = []
-                image_blocks = []
-                seen_image_hashes = set()
                 table_counter = 0
                 chart_counter = 0
-                image_counter = 0
 
                 for shape in slide.shapes:
                     if shape.has_text_frame and shape.text.strip():
@@ -362,12 +200,12 @@ def build_vector_database():
                         for row in shape.table.rows:
                             row_data = [_clean_text(cell.text) for cell in row.cells]
                             table_rows.append(" | ".join(row_data))
-
                         if table_rows:
                             table_counter += 1
                             table_text = (
                                 f"{_slide_header(actual_filename, slide_index)}\n"
                                 "Content Type: Table\n"
+                                f"Slide Title: {slide_title}\n"
                                 f"Table Index: {table_counter}\n"
                                 "Table Data:\n"
                                 + "\n".join(table_rows)
@@ -407,85 +245,10 @@ def build_vector_database():
                                     element_index=chart_counter,
                                 )
                             )
-                        continue
 
-                    if hasattr(shape, "image"):
-                        image_blob = shape.image.blob
-                        image_ext = getattr(shape.image, "ext", "") or ""
-                        image_hash = hashlib.sha256(image_blob).hexdigest()
-                        if image_hash in seen_image_hashes:
-                            continue
-
-                        seen_image_hashes.add(image_hash)
-                        image_counter += 1
-                        logging.info(
-                            f"   -> Processing image {image_counter} on Slide {slide_index}..."
-                        )
-                        base64_img, mime_type = _get_supported_vision_payload(
-                            image_blob=image_blob,
-                            image_ext=image_ext,
-                        )
-                        ocr_text = _extract_ocr_text(
-                            image_blob=image_blob,
-                            image_ext=image_ext,
-                            slide_index=slide_index,
-                            image_index=image_counter,
-                        )
-                        image_metadata = {
-                            "filename": actual_filename,
-                            "page_number": slide_index,
-                            "slide_text": "\n".join(text_blocks),
-                            "chart_text": "\n".join(chart_blocks),
-                            "ocr_text": ocr_text,
-                            "slide_title": slide_title,
-                            "image_ext": image_ext,
-                        }
-                        try:
-                            desc = ""
-                            if base64_img and mime_type:
-                                desc = llm.describe_image(
-                                    base64_image=base64_img,
-                                    mime_type=mime_type,
-                                    metadata=image_metadata,
-                                )
-                            else:
-                                logging.warning(
-                                    f"Skipping vision for image {image_counter} on slide {slide_index} "
-                                    f"because format '{image_ext or 'unknown'}' is not supported."
-                                )
-                            cleaned_desc = _clean_text(desc)
-                            if cleaned_desc or ocr_text:
-                                image_sections = []
-                                if ocr_text:
-                                    image_sections.append(f"OCR Text:\n{ocr_text}")
-                                if cleaned_desc:
-                                    image_sections.append(f"Image Description:\n{cleaned_desc}")
-                                image_text = (
-                                    f"{_slide_header(actual_filename, slide_index)}\n"
-                                    "Content Type: Image\n"
-                                    f"Image Format: {image_ext or 'unknown'}\n"
-                                    f"Image Index: {image_counter}\n"
-                                    + "\n\n".join(image_sections)
-                                )
-                                image_blocks.append(image_text)
-                                raw_documents.append(
-                                    _make_document(
-                                        file_path=file_path,
-                                        filename=actual_filename,
-                                        slide_index=slide_index,
-                                        content_type="image",
-                                        content=image_text,
-                                        slide_title=slide_title,
-                                        element_index=image_counter,
-                                    )
-                                )
-                        except Exception as exc:
-                            logging.error(f"Vision failed on slide {slide_index}: {exc}")
-
-                slide_sections = []
                 slide_title = _pick_slide_title(text_blocks)
                 raw_documents.extend(
-                    _build_text_section_documents(
+                    _build_text_documents(
                         file_path=file_path,
                         filename=actual_filename,
                         slide_index=slide_index,
@@ -493,19 +256,20 @@ def build_vector_database():
                         text_blocks=text_blocks,
                     )
                 )
+
+                slide_sections = []
                 if text_blocks:
                     slide_sections.append("Slide Text:\n" + "\n".join(text_blocks))
                 if table_blocks:
                     slide_sections.append("Tables:\n" + "\n\n".join(table_blocks))
                 if chart_blocks:
                     slide_sections.append("Charts:\n" + "\n\n".join(chart_blocks))
-                if image_blocks:
-                    slide_sections.append("Images:\n" + "\n\n".join(image_blocks))
 
                 if slide_sections:
-                    slide_text = (
+                    slide_summary = (
                         f"{_slide_header(actual_filename, slide_index)}\n"
-                        "Content Type: Slide Summary\n\n"
+                        "Content Type: Slide Summary\n"
+                        f"Slide Title: {slide_title}\n\n"
                         + "\n\n".join(slide_sections)
                     )
                     raw_documents.append(
@@ -514,7 +278,7 @@ def build_vector_database():
                             filename=actual_filename,
                             slide_index=slide_index,
                             content_type="slide_summary",
-                            content=slide_text,
+                            content=slide_summary,
                             slide_title=slide_title,
                         )
                     )
@@ -524,16 +288,12 @@ def build_vector_database():
 
     logging.info(f"Extracted {len(raw_documents)} total retrievable items. Starting chunking...")
 
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500,
-        chunk_overlap=150,
-    )
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=120)
     chunked_docs = text_splitter.split_documents(raw_documents)
     logging.info(f"Created {len(chunked_docs)} chunks.")
 
-    db_directory = "./chroma_db"
+    db_directory = "./chroma_db_simple"
     logging.info("Saving to Chroma DB...")
-
     if os.path.isdir(db_directory):
         shutil.rmtree(db_directory)
 
@@ -543,7 +303,7 @@ def build_vector_database():
         persist_directory=db_directory,
     )
 
-    logging.info("Database built successfully!")
+    logging.info("Simple database built successfully!")
 
 
 if __name__ == "__main__":
