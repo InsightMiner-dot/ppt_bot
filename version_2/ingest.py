@@ -226,7 +226,39 @@ def _extract_chart_text(shape, filename: str, slide_index: int, chart_index: int
         return None
 
 
-def _extract_ocr_text(image_blob: bytes, slide_index: int, image_index: int) -> str:
+def _get_supported_vision_payload(image_blob: bytes, image_ext: str) -> tuple[str, str] | tuple[None, None]:
+    normalized_ext = image_ext.lower().strip(".")
+    mime_type_map = {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "gif": "image/gif",
+        "webp": "image/webp",
+    }
+
+    if normalized_ext in mime_type_map:
+        return base64.b64encode(image_blob).decode("utf-8"), mime_type_map[normalized_ext]
+
+    try:
+        from PIL import Image
+    except ImportError:
+        return None, None
+
+    try:
+        image = Image.open(io.BytesIO(image_blob))
+        converted = io.BytesIO()
+        image.convert("RGB").save(converted, format="PNG")
+        return base64.b64encode(converted.getvalue()).decode("utf-8"), "image/png"
+    except Exception:
+        return None, None
+
+
+def _extract_ocr_text(
+    image_blob: bytes,
+    image_ext: str,
+    slide_index: int,
+    image_index: int,
+) -> str:
     try:
         from PIL import Image
         import pytesseract
@@ -261,7 +293,8 @@ def _extract_ocr_text(image_blob: bytes, slide_index: int, image_index: int) -> 
         return cleaned_text
     except Exception as exc:
         logging.warning(
-            f"OCR failed for image {image_index} on slide {slide_index}: {exc}"
+            f"OCR failed for image {image_index} on slide {slide_index} "
+            f"(format: {image_ext or 'unknown'}): {exc}"
         )
         return ""
 
@@ -378,6 +411,7 @@ def build_vector_database():
 
                     if hasattr(shape, "image"):
                         image_blob = shape.image.blob
+                        image_ext = getattr(shape.image, "ext", "") or ""
                         image_hash = hashlib.sha256(image_blob).hexdigest()
                         if image_hash in seen_image_hashes:
                             continue
@@ -387,9 +421,13 @@ def build_vector_database():
                         logging.info(
                             f"   -> Processing image {image_counter} on Slide {slide_index}..."
                         )
-                        base64_img = base64.b64encode(image_blob).decode("utf-8")
+                        base64_img, mime_type = _get_supported_vision_payload(
+                            image_blob=image_blob,
+                            image_ext=image_ext,
+                        )
                         ocr_text = _extract_ocr_text(
                             image_blob=image_blob,
+                            image_ext=image_ext,
                             slide_index=slide_index,
                             image_index=image_counter,
                         )
@@ -400,21 +438,32 @@ def build_vector_database():
                             "chart_text": "\n".join(chart_blocks),
                             "ocr_text": ocr_text,
                             "slide_title": slide_title,
+                            "image_ext": image_ext,
                         }
                         try:
-                            desc = llm.describe_image(
-                                base64_image=base64_img,
-                                metadata=image_metadata,
-                            )
+                            desc = ""
+                            if base64_img and mime_type:
+                                desc = llm.describe_image(
+                                    base64_image=base64_img,
+                                    mime_type=mime_type,
+                                    metadata=image_metadata,
+                                )
+                            else:
+                                logging.warning(
+                                    f"Skipping vision for image {image_counter} on slide {slide_index} "
+                                    f"because format '{image_ext or 'unknown'}' is not supported."
+                                )
                             cleaned_desc = _clean_text(desc)
-                            if cleaned_desc:
+                            if cleaned_desc or ocr_text:
                                 image_sections = []
                                 if ocr_text:
                                     image_sections.append(f"OCR Text:\n{ocr_text}")
-                                image_sections.append(f"Image Description:\n{cleaned_desc}")
+                                if cleaned_desc:
+                                    image_sections.append(f"Image Description:\n{cleaned_desc}")
                                 image_text = (
                                     f"{_slide_header(actual_filename, slide_index)}\n"
                                     "Content Type: Image\n"
+                                    f"Image Format: {image_ext or 'unknown'}\n"
                                     f"Image Index: {image_counter}\n"
                                     + "\n\n".join(image_sections)
                                 )
