@@ -26,6 +26,12 @@ def _clean_text(value: str) -> str:
     return " ".join(value.split())
 
 
+def _extract_text_block(value: str) -> str:
+    lines = [_clean_text(line) for line in value.splitlines()]
+    lines = [line for line in lines if line]
+    return "\n".join(lines)
+
+
 def _slide_header(filename: str, slide_index: int) -> str:
     return f"Filename: {filename}\nSlide Number: {slide_index}"
 
@@ -37,6 +43,126 @@ def _pick_slide_title(text_blocks: list[str]) -> str:
             if cleaned_line:
                 return cleaned_line
     return ""
+
+
+def _make_semantic_section_text(
+    filename: str,
+    slide_index: int,
+    slide_title: str,
+    section_name: str,
+    body: str,
+) -> str:
+    parts = [
+        _slide_header(filename, slide_index),
+        f"Content Type: {section_name}",
+    ]
+    if slide_title:
+        parts.append(f"Slide Title: {slide_title}")
+    parts.append(body)
+    return "\n".join(parts)
+
+
+def _build_text_section_documents(
+    file_path: str,
+    filename: str,
+    slide_index: int,
+    slide_title: str,
+    text_blocks: list[str],
+) -> list[Document]:
+    documents: list[Document] = []
+    if not text_blocks:
+        return documents
+
+    seen_bodies = set()
+
+    if slide_title:
+        title_text = _make_semantic_section_text(
+            filename=filename,
+            slide_index=slide_index,
+            slide_title=slide_title,
+            section_name="title",
+            body=f"Title:\n{slide_title}",
+        )
+        documents.append(
+            _make_document(
+                file_path=file_path,
+                filename=filename,
+                slide_index=slide_index,
+                content_type="title",
+                content=title_text,
+                slide_title=slide_title,
+            )
+        )
+        seen_bodies.add(title_text)
+
+    for block_index, block in enumerate(text_blocks, start=1):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+
+        section_type = "text_section"
+        if any("comment" in line.lower() for line in lines):
+            section_type = "comments"
+
+        body = (
+            f"Section Index: {block_index}\n"
+            + "\n".join(lines)
+        )
+        section_text = _make_semantic_section_text(
+            filename=filename,
+            slide_index=slide_index,
+            slide_title=slide_title,
+            section_name=section_type,
+            body=body,
+        )
+        if section_text in seen_bodies:
+            continue
+
+        documents.append(
+            _make_document(
+                file_path=file_path,
+                filename=filename,
+                slide_index=slide_index,
+                content_type=section_type,
+                content=section_text,
+                slide_title=slide_title,
+                element_index=block_index,
+            )
+        )
+        seen_bodies.add(section_text)
+
+        if section_type != "comments":
+            for line_index, line in enumerate(lines, start=1):
+                if "comment" not in line.lower():
+                    continue
+                comment_window = lines[line_index - 1 : min(line_index + 3, len(lines))]
+                comments_text = _make_semantic_section_text(
+                    filename=filename,
+                    slide_index=slide_index,
+                    slide_title=slide_title,
+                    section_name="comments",
+                    body=(
+                        f"Section Index: {block_index}\n"
+                        "Comment-Focused Text:\n"
+                        + "\n".join(comment_window)
+                    ),
+                )
+                if comments_text in seen_bodies:
+                    continue
+                documents.append(
+                    _make_document(
+                        file_path=file_path,
+                        filename=filename,
+                        slide_index=slide_index,
+                        content_type="comments",
+                        content=comments_text,
+                        slide_title=slide_title,
+                        element_index=block_index * 100 + line_index,
+                    )
+                )
+                seen_bodies.add(comments_text)
+
+    return documents
 
 
 def _extract_chart_text(shape, filename: str, slide_index: int, chart_index: int) -> str | None:
@@ -166,7 +292,7 @@ def build_vector_database():
 
                 for shape in slide.shapes:
                     if shape.has_text_frame and shape.text.strip():
-                        cleaned_text = _clean_text(shape.text)
+                        cleaned_text = _extract_text_block(shape.text)
                         if cleaned_text:
                             text_blocks.append(cleaned_text)
                         continue
@@ -283,6 +409,16 @@ def build_vector_database():
                             logging.error(f"Vision failed on slide {slide_index}: {exc}")
 
                 slide_sections = []
+                slide_title = _pick_slide_title(text_blocks)
+                raw_documents.extend(
+                    _build_text_section_documents(
+                        file_path=file_path,
+                        filename=actual_filename,
+                        slide_index=slide_index,
+                        slide_title=slide_title,
+                        text_blocks=text_blocks,
+                    )
+                )
                 if text_blocks:
                     slide_sections.append("Slide Text:\n" + "\n".join(text_blocks))
                 if table_blocks:
@@ -293,7 +429,6 @@ def build_vector_database():
                     slide_sections.append("Images:\n" + "\n\n".join(image_blocks))
 
                 if slide_sections:
-                    slide_title = _pick_slide_title(text_blocks)
                     slide_text = (
                         f"{_slide_header(actual_filename, slide_index)}\n"
                         "Content Type: Slide Summary\n\n"
