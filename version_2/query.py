@@ -51,6 +51,9 @@ def _score_chunk(question: str, chunk) -> int:
         elif normalized_target in title_hint:
             score += 3
 
+    if chunk.metadata.get("content_type") == "comments":
+        score += 2
+
     for line in chunk.page_content.splitlines():
         normalized_line = _normalize(line)
         if not normalized_line:
@@ -66,7 +69,7 @@ def _score_chunk(question: str, chunk) -> int:
 
 
 def query_presentations(question: str):
-    db_directory = "./chroma_db"
+    db_directory = "./chroma_db_simple"
 
     logging.info("Loading Chroma DB...")
     try:
@@ -114,27 +117,24 @@ def query_presentations(question: str):
     - Filename: [Insert Filename], Page Number: [Insert Page]
 
     MATCHING GUIDANCE:
-    If the question names a specific slide title or header, prefer chunks that match that title/header most closely.
-    Treat nearby variants like "MTD vs FC7+5" and "MTD vs FC7+5-M&S" as different slides when the evidence supports that distinction.
-    If the retrieval is ambiguous, say so briefly instead of confidently mixing the slides.
+    Prefer chunks whose slide title most closely matches the user question.
+    If similar slide titles appear, avoid mixing them unless the retrieved evidence clearly supports it.
     """
 
     logging.info("Sending retrieved context to Azure OpenAI...")
     try:
         response = llm.ask_llm(question=question + instruction, context=context)
-
         print("\n" + "=" * 50)
         print("LLM RESPONSE:")
         print("=" * 50)
         print(response)
 
-        with open(r"response.md", "w", encoding="utf-8") as file_handle:
+        with open(r"response_simple.md", "w", encoding="utf-8") as file_handle:
             file_handle.write(response)
-
     except Exception as exc:
         logging.error(f"Error querying the LLM: {exc}")
 
 
 if __name__ == "__main__":
-    user_query = "Summarize the key financial trends across all the Q3 reports."
+    user_query = "What comments are present in November MTD vs FC7+5?"
     query_presentations(user_query)
