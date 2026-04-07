@@ -20,7 +20,6 @@ llm = AzureChatOpenAI(
     temperature=0
 )
 
-# ... (Keep all your existing llm.py code above this) ...
 from langchain_openai import AzureOpenAIEmbeddings
 
 # NEW: Initialize the Embedding Model for Chroma DB
@@ -55,8 +54,9 @@ def describe_image(base64_image: str, metadata: dict) -> str:
     vision_prompt = (
         f"You are looking at an extracted image/chart from a PowerPoint presentation.\n"
         f"Context - Filename: {metadata.get('filename', 'Unknown')}, Slide Number: {metadata.get('page_number', 'Unknown')}.\n"
-        f"Describe this image, chart, or table in detail. Extract any numbers, trends, or text present "
-        f"so this description can be used as context to answer user questions later."
+        "Return a concise retrieval-friendly description for semantic search.\n"
+        "Focus on the visible title/topic, readable text, important numbers, labels, trends, and any "
+        "clear business meaning. If the image is decorative or unreadable, say that directly in one sentence."
     )
 
     message = HumanMessage(
