@@ -45,22 +45,22 @@ def _score_chunk(question: str, chunk) -> int:
     title_hint = _normalize(str(chunk.metadata.get("slide_title", "")))
     if title_hint:
         if title_hint == normalized_target:
-            score += 12
+            score += 10
         elif title_hint.startswith(normalized_target + " "):
-            score -= 5
+            score -= 2
         elif normalized_target in title_hint:
-            score += 2
+            score += 3
 
     for line in chunk.page_content.splitlines():
         normalized_line = _normalize(line)
         if not normalized_line:
             continue
         if normalized_line == normalized_target:
-            score += 8
+            score += 6
         elif normalized_line.startswith(normalized_target + " "):
-            score -= 4
+            score -= 1
         elif normalized_target in normalized_line:
-            score += 1
+            score += 2
 
     return score
 
@@ -113,9 +113,10 @@ def query_presentations(question: str):
     Format it as a bulleted list exactly like this:
     - Filename: [Insert Filename], Page Number: [Insert Page]
 
-    IMPORTANT MATCHING RULE:
-    If the question names a specific slide title or header, only answer from chunks that match that title/header exactly.
-    Do not merge it with nearby variants or extended titles. For example, "November MTD vs FC7+5" and "November MTD vs FC7+5-M&S" are different slides.
+    MATCHING GUIDANCE:
+    If the question names a specific slide title or header, prefer chunks that match that title/header most closely.
+    Treat nearby variants like "MTD vs FC7+5" and "MTD vs FC7+5-M&S" as different slides when the evidence supports that distinction.
+    If the retrieval is ambiguous, say so briefly instead of confidently mixing the slides.
     """
 
     logging.info("Sending retrieved context to Azure OpenAI...")
