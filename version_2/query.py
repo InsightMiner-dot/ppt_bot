@@ -103,7 +103,7 @@ def query_presentations(question: str):
         context += f"### Retrieved Chunk {idx} ###\n"
         context += (
             f"[Source: {meta.get('filename', 'Unknown')}, "
-            f"Page: {meta.get('page', 'Unknown')}, "
+            f"Slide: {meta.get('slide', 'Unknown')}, "
             f"Type: {meta.get('content_type', 'Unknown')}]\n"
         )
         context += f"Content:\n{chunk.page_content}\n\n"
@@ -114,11 +114,13 @@ def query_presentations(question: str):
     IMPORTANT INSTRUCTION FOR REFERENCES:
     At the very end of your response, you MUST include a comprehensive "References" section citing the exact documents you used to formulate your answer.
     Format it as a bulleted list exactly like this:
-    - Filename: [Insert Filename], Page Number: [Insert Page]
+    - Filename: [Insert Filename], Slide Number: [Insert Slide]
 
     MATCHING GUIDANCE:
     Prefer chunks whose slide title most closely matches the user question.
     If similar slide titles appear, avoid mixing them unless the retrieved evidence clearly supports it.
+    If relevant evidence is present in the retrieved chunks, answer from it directly instead of saying "I don't know".
+    If the evidence is partial, give the partial answer and briefly say what is unclear.
     """
 
     logging.info("Sending retrieved context to Azure OpenAI...")
