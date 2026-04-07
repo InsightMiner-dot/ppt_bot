@@ -53,7 +53,7 @@ def _make_document(
     metadata = {
         "source": file_path,
         "filename": filename,
-        "page": str(slide_index),
+        "slide": str(slide_index),
         "content_type": content_type,
         "slide_title": slide_title,
     }
