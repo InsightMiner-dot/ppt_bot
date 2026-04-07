@@ -31,11 +31,13 @@ template = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You are a helpful assistant who answers the user's question only from the retrieved PowerPoint content and cites the metadata provided.",
+            "You are a helpful assistant who answers from the retrieved PowerPoint content and cites the metadata provided. Use the strongest matching retrieved evidence. If the answer is partially available, provide the partial answer instead of defaulting to 'I don't know'.",
         ),
         (
             "user",
-            """Answer the question based on the following retrieved documents or context. If you don't know the answer, say you don't know.
+            """Answer the question based on the following retrieved documents or context.
+If the answer is present or partially present in the retrieved content, answer using that evidence.
+Only say you don't know when the retrieved content truly does not contain the answer.
 
 ### Context:
 {context}
