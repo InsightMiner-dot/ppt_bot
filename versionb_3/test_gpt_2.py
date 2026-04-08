@@ -1,8 +1,7 @@
-import os
 import hashlib
-from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
+from collections import defaultdict
 
+from langchain_community.document_loaders import UnstructuredPowerPointLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -32,54 +31,58 @@ def get_file_hash(file_path):
 
 
 # =========================
-# ✅ NORMALIZATION (CRITICAL)
+# ✅ LOAD PPT (ELEMENT MODE)
 # =========================
-def normalize(text):
-    return (
-        text.lower()
-        .replace("&", "and")
-        .replace("-", "")
-        .replace("  ", " ")
-        .strip()
+def load_ppt_elements(file_path):
+    loader = UnstructuredPowerPointLoader(
+        file_path,
+        mode="elements"   # 🔥 KEY
     )
+    return loader.load()
 
 
 # =========================
-# ✅ EXTRACTION
+# ✅ GROUP BY SLIDE
 # =========================
-def extract_ppt(file_path):
-    prs = Presentation(file_path)
-    file_name = os.path.basename(file_path)
-    version = get_file_hash(file_path)
+def group_by_slide(elements, file_name, version):
+
+    slides = defaultdict(lambda: {
+        "title": None,
+        "comments": []
+    })
+
+    for el in elements:
+        meta = el.metadata
+
+        slide_num = meta.get("page_number")
+        category = meta.get("category")  # Title, ListItem, NarrativeText
+
+        text = el.page_content.strip()
+
+        if not slide_num or not text:
+            continue
+
+        # Title
+        if category == "Title":
+            slides[slide_num]["title"] = text
+
+        # Comments / bullets
+        elif category in ["ListItem", "NarrativeText"]:
+            slides[slide_num]["comments"].append(text)
 
     docs = []
 
-    for i, slide in enumerate(prs.slides):
-        comments = []
-        slide_title = None
-        chart_count = 0
-
-        for shape in slide.shapes:
-
-            if shape.has_text_frame:
-                text = shape.text.strip()
-                if text:
-                    comments.append(text)
-                    if not slide_title:
-                        slide_title = text
-
-            if shape.shape_type == MSO_SHAPE_TYPE.CHART:
-                chart_count += 1
+    for slide, data in slides.items():
+        content = "\n".join(data["comments"])
 
         docs.append({
-            "content": "\n".join(comments),
+            "content": content,
             "metadata": {
                 "file_name": file_name,
                 "version": version,
-                "slide_number": i + 1,
-                "slide_title": slide_title,
-                "chart_count": chart_count,
-                "source": f"{file_name}_slide_{i+1}"
+                "slide_number": slide,
+                "slide_title": data["title"],
+                "source": f"{file_name}_slide_{slide}"
             }
         })
 
@@ -120,23 +123,21 @@ def chunk_documents(docs, chunk_size=500, chunk_overlap=100):
 
         prefix = f"Slide Title: {meta.get('slide_title','')}\n"
 
-        if len(text) <= chunk_size:
-            meta["chunk_id"] = 0
-            meta["chunk_uid"] = chunk_id(meta["file_name"], meta["slide_number"], 0, meta["version"])
-            final_docs.append(Document(page_content=prefix + text, metadata=meta))
-            continue
-
         chunks = splitter.split_text(text)
 
         for idx, chunk in enumerate(chunks):
-            if not chunk.strip():
-                continue
-
             meta_copy = meta.copy()
             meta_copy["chunk_id"] = idx
-            meta_copy["chunk_uid"] = chunk_id(meta["file_name"], meta["slide_number"], idx, meta["version"])
+            meta_copy["chunk_uid"] = chunk_id(
+                meta["file_name"],
+                meta["slide_number"],
+                idx,
+                meta["version"]
+            )
 
-            final_docs.append(Document(page_content=prefix + chunk, metadata=meta_copy))
+            final_docs.append(
+                Document(page_content=prefix + chunk, metadata=meta_copy)
+            )
 
     return final_docs
 
@@ -176,55 +177,24 @@ def upsert(vs, docs):
 
 
 # =========================
-# ✅ QUERY CLEANING
-# =========================
-def clean_query(query):
-    return query.lower().replace("what are the comments in", "").strip()
-
-
-# =========================
-# ✅ RETRIEVE (FIXED LOGIC)
+# ✅ RETRIEVE (TITLE FIRST)
 # =========================
 def retrieve(vs, query, k=5):
 
-    query_clean = clean_query(query)
-    query_norm = normalize(query_clean)
-
     all_data = vs.get()
 
-    exact = []
-    partial = []
+    title_docs = []
 
     for content, meta in zip(all_data["documents"], all_data["metadatas"]):
-        title = meta.get("slide_title") or ""
-        title_norm = normalize(title)
+        title = (meta.get("slide_title") or "").lower()
 
-        if query_norm == title_norm:
-            exact.append(Document(page_content=content, metadata=meta))
+        if title and title in query.lower():
+            title_docs.append(Document(page_content=content, metadata=meta))
 
-        elif query_norm in title_norm:
-            partial.append(Document(page_content=content, metadata=meta))
+    if title_docs:
+        return title_docs[:k]
 
-    # ✅ priority
-    if exact:
-        return exact[:k]
-
-    if partial:
-        return partial[:k]
-
-    # fallback
     return vs.similarity_search(query, k=k)
-
-
-# =========================
-# ✅ FILTER SAME SLIDE
-# =========================
-def filter_same_slide(docs):
-    if not docs:
-        return docs
-
-    slide = docs[0].metadata["slide_number"]
-    return [d for d in docs if d.metadata["slide_number"] == slide]
 
 
 # =========================
@@ -235,58 +205,6 @@ def build_context(docs):
         f"File: {d.metadata['file_name']} | Slide: {d.metadata['slide_number']}\n{d.page_content}"
         for d in docs
     ])
-
-
-# =========================
-# ✅ INTENT
-# =========================
-def classify_query(query):
-    q = query.lower()
-
-    if "comment" in q:
-        return "comments"
-    if any(w in q for w in ["trend", "growth", "analysis"]):
-        return "chart"
-    return "general"
-
-
-# =========================
-# ✅ PROMPT
-# =========================
-def build_prompt(query, context, intent):
-
-    if intent == "comments":
-        return f"""
-Extract bullet point comments.
-
-Context:
-{context}
-
-Question:
-{query}
-"""
-
-    elif intent == "chart":
-        return f"""
-Analyze trends.
-
-Context:
-{context}
-
-Question:
-{query}
-"""
-
-    else:
-        return f"""
-Answer based on context.
-
-Context:
-{context}
-
-Question:
-{query}
-"""
 
 
 # =========================
@@ -307,17 +225,24 @@ def get_llm():
 # =========================
 def answer(query, vs, llm):
 
-    intent = classify_query(query)
-
-    docs = retrieve(vs, query, k=8)
-    docs = filter_same_slide(docs)
+    docs = retrieve(vs, query, k=5)
 
     if not docs:
         return "No data found."
 
     context = build_context(docs)
 
-    prompt = build_prompt(query, context, intent)
+    prompt = f"""
+Answer the question based on the slide content.
+
+If asking for comments → return bullet points.
+
+Context:
+{context}
+
+Question:
+{query}
+"""
 
     response = llm.invoke(prompt).content
 
@@ -336,8 +261,12 @@ if __name__ == "__main__":
 
     ppt_file = "input.pptx"
 
-    raw = extract_ppt(ppt_file)
-    docs = to_docs(raw)
+    elements = load_ppt_elements(ppt_file)
+
+    version = get_file_hash(ppt_file)
+    docs = group_by_slide(elements, ppt_file, version)
+
+    docs = to_docs(docs)
     chunks = chunk_documents(docs)
 
     emb = get_embedding()
@@ -345,7 +274,7 @@ if __name__ == "__main__":
 
     upsert(vs, chunks)
 
-    print("✅ Pipeline Ready")
+    print("✅ New Pipeline Ready")
 
     llm = get_llm()
 
