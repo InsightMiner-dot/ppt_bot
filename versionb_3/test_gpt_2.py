@@ -32,7 +32,7 @@ def get_file_hash(file_path):
 
 
 # =========================
-# ✅ EXTRACTION (COMMENTS + CHART SEPARATED)
+# ✅ EXTRACTION (SAFE METADATA)
 # =========================
 def extract_ppt(file_path):
     prs = Presentation(file_path)
@@ -43,12 +43,12 @@ def extract_ppt(file_path):
 
     for i, slide in enumerate(prs.slides):
         comments = []
-        charts = []
         slide_title = None
+        chart_count = 0
 
         for shape in slide.shapes:
 
-            # TEXT → COMMENTS
+            # TEXT
             if shape.has_text_frame:
                 text = shape.text.strip()
                 if text:
@@ -56,33 +56,18 @@ def extract_ppt(file_path):
                     if not slide_title:
                         slide_title = text
 
-            # CHART → STRUCTURED
+            # CHART → only count (no complex metadata)
             if shape.shape_type == MSO_SHAPE_TYPE.CHART:
-                chart = shape.chart
-
-                chart_data = {}
-
-                if chart.has_title:
-                    chart_data["title"] = chart.chart_title.text_frame.text
-
-                series_list = []
-                for s in chart.series:
-                    series_list.append({
-                        "name": s.name,
-                        "values": list(s.values)
-                    })
-
-                chart_data["series"] = series_list
-                charts.append(chart_data)
+                chart_count += 1
 
         docs.append({
-            "content": "\n".join(comments),  # 🔥 only comments for embedding
+            "content": "\n".join(comments),
             "metadata": {
                 "file_name": file_name,
                 "version": version,
                 "slide_number": i + 1,
                 "slide_title": slide_title,
-                "charts": charts,
+                "chart_count": chart_count,  # ✅ SAFE
                 "source": f"{file_name}_slide_{i+1}"
             }
         })
@@ -134,6 +119,9 @@ def chunk_documents(docs, chunk_size=500, chunk_overlap=100):
         chunks = splitter.split_text(text)
 
         for idx, chunk in enumerate(chunks):
+            if not chunk.strip():
+                continue
+
             meta_copy = meta.copy()
             meta_copy["chunk_id"] = idx
             meta_copy["chunk_uid"] = chunk_id(meta["file_name"], meta["slide_number"], idx, meta["version"])
@@ -251,7 +239,7 @@ Question:
 
     elif intent == "chart":
         return f"""
-Analyze trends and insights from the context.
+Analyze trends based on the context.
 
 Context:
 {context}
