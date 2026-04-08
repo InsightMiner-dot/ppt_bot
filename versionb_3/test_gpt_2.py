@@ -32,7 +32,20 @@ def get_file_hash(file_path):
 
 
 # =========================
-# ✅ EXTRACTION (SAFE METADATA)
+# ✅ NORMALIZATION (CRITICAL)
+# =========================
+def normalize(text):
+    return (
+        text.lower()
+        .replace("&", "and")
+        .replace("-", "")
+        .replace("  ", " ")
+        .strip()
+    )
+
+
+# =========================
+# ✅ EXTRACTION
 # =========================
 def extract_ppt(file_path):
     prs = Presentation(file_path)
@@ -48,7 +61,6 @@ def extract_ppt(file_path):
 
         for shape in slide.shapes:
 
-            # TEXT
             if shape.has_text_frame:
                 text = shape.text.strip()
                 if text:
@@ -56,7 +68,6 @@ def extract_ppt(file_path):
                     if not slide_title:
                         slide_title = text
 
-            # CHART → only count (no complex metadata)
             if shape.shape_type == MSO_SHAPE_TYPE.CHART:
                 chart_count += 1
 
@@ -67,7 +78,7 @@ def extract_ppt(file_path):
                 "version": version,
                 "slide_number": i + 1,
                 "slide_title": slide_title,
-                "chart_count": chart_count,  # ✅ SAFE
+                "chart_count": chart_count,
                 "source": f"{file_name}_slide_{i+1}"
             }
         })
@@ -112,7 +123,6 @@ def chunk_documents(docs, chunk_size=500, chunk_overlap=100):
         if len(text) <= chunk_size:
             meta["chunk_id"] = 0
             meta["chunk_uid"] = chunk_id(meta["file_name"], meta["slide_number"], 0, meta["version"])
-
             final_docs.append(Document(page_content=prefix + text, metadata=meta))
             continue
 
@@ -166,47 +176,55 @@ def upsert(vs, docs):
 
 
 # =========================
-# ✅ QUERY INTENT
+# ✅ QUERY CLEANING
 # =========================
-def classify_query(query):
-    q = query.lower()
-
-    if any(w in q for w in ["comment", "observation", "remark"]):
-        return "comments"
-
-    if any(w in q for w in ["trend", "growth", "increase", "decrease", "analysis"]):
-        return "chart"
-
-    return "general"
+def clean_query(query):
+    return query.lower().replace("what are the comments in", "").strip()
 
 
 # =========================
-# ✅ RETRIEVE (TITLE + SEMANTIC)
+# ✅ RETRIEVE (FIXED LOGIC)
 # =========================
 def retrieve(vs, query, k=5):
 
-    semantic_docs = vs.similarity_search(query, k=k)
+    query_clean = clean_query(query)
+    query_norm = normalize(query_clean)
 
     all_data = vs.get()
-    title_docs = []
+
+    exact = []
+    partial = []
 
     for content, meta in zip(all_data["documents"], all_data["metadatas"]):
-        title = (meta.get("slide_title") or "").lower()
+        title = meta.get("slide_title") or ""
+        title_norm = normalize(title)
 
-        if any(word in title for word in query.lower().split()):
-            title_docs.append(Document(page_content=content, metadata=meta))
+        if query_norm == title_norm:
+            exact.append(Document(page_content=content, metadata=meta))
 
-    # merge + dedupe
-    seen = set()
-    final = []
+        elif query_norm in title_norm:
+            partial.append(Document(page_content=content, metadata=meta))
 
-    for d in title_docs + semantic_docs:
-        uid = d.metadata["chunk_uid"]
-        if uid not in seen:
-            seen.add(uid)
-            final.append(d)
+    # ✅ priority
+    if exact:
+        return exact[:k]
 
-    return final[:k]
+    if partial:
+        return partial[:k]
+
+    # fallback
+    return vs.similarity_search(query, k=k)
+
+
+# =========================
+# ✅ FILTER SAME SLIDE
+# =========================
+def filter_same_slide(docs):
+    if not docs:
+        return docs
+
+    slide = docs[0].metadata["slide_number"]
+    return [d for d in docs if d.metadata["slide_number"] == slide]
 
 
 # =========================
@@ -220,15 +238,26 @@ def build_context(docs):
 
 
 # =========================
-# ✅ PROMPT BUILDER
+# ✅ INTENT
+# =========================
+def classify_query(query):
+    q = query.lower()
+
+    if "comment" in q:
+        return "comments"
+    if any(w in q for w in ["trend", "growth", "analysis"]):
+        return "chart"
+    return "general"
+
+
+# =========================
+# ✅ PROMPT
 # =========================
 def build_prompt(query, context, intent):
 
     if intent == "comments":
         return f"""
-Extract key comments from the context.
-
-Return bullet points.
+Extract bullet point comments.
 
 Context:
 {context}
@@ -239,7 +268,7 @@ Question:
 
     elif intent == "chart":
         return f"""
-Analyze trends based on the context.
+Analyze trends.
 
 Context:
 {context}
@@ -250,7 +279,7 @@ Question:
 
     else:
         return f"""
-Answer based on the context.
+Answer based on context.
 
 Context:
 {context}
@@ -281,6 +310,7 @@ def answer(query, vs, llm):
     intent = classify_query(query)
 
     docs = retrieve(vs, query, k=8)
+    docs = filter_same_slide(docs)
 
     if not docs:
         return "No data found."
@@ -315,7 +345,7 @@ if __name__ == "__main__":
 
     upsert(vs, chunks)
 
-    print("✅ RAG Pipeline Ready")
+    print("✅ Pipeline Ready")
 
     llm = get_llm()
 
