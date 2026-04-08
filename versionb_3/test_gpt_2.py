@@ -32,7 +32,7 @@ def get_file_hash(file_path):
 
 
 # =========================
-# ✅ EXTRACTION (TEXT + CHARTS ONLY)
+# ✅ EXTRACTION
 # =========================
 def extract_ppt(file_path):
     prs = Presentation(file_path)
@@ -47,7 +47,6 @@ def extract_ppt(file_path):
 
         for shape in slide.shapes:
 
-            # TEXT
             if shape.has_text_frame:
                 text = shape.text.strip()
                 if text:
@@ -55,7 +54,6 @@ def extract_ppt(file_path):
                     if not slide_title:
                         slide_title = text
 
-            # CHART
             if shape.shape_type == MSO_SHAPE_TYPE.CHART:
                 chart = shape.chart
 
@@ -82,9 +80,9 @@ def extract_ppt(file_path):
 
 
 # =========================
-# ✅ CONVERT TO DOCUMENT
+# ✅ TO DOCUMENT
 # =========================
-def to_langchain_docs(docs):
+def to_docs(docs):
     return [
         Document(page_content=d["content"], metadata=d["metadata"])
         for d in docs
@@ -94,64 +92,66 @@ def to_langchain_docs(docs):
 # =========================
 # ✅ CHUNK ID
 # =========================
-def generate_chunk_id(file_name, slide_number, chunk_id, version):
-    base = f"{file_name}_{slide_number}_{chunk_id}_{version}"
-    return hashlib.md5(base.encode()).hexdigest()
+def chunk_id(file, slide, idx, version):
+    return hashlib.md5(f"{file}_{slide}_{idx}_{version}".encode()).hexdigest()
 
 
 # =========================
 # ✅ CHUNKING
 # =========================
-def chunk_documents(documents, chunk_size=500, chunk_overlap=100):
+def chunk_documents(docs, chunk_size=500, chunk_overlap=100):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap
     )
 
-    chunked_docs = []
+    final_docs = []
 
-    for doc in documents:
+    for doc in docs:
         text = doc.page_content.strip()
         meta = doc.metadata.copy()
 
         if not text:
             continue
 
-        context_prefix = f"Slide Title: {meta.get('slide_title', '')}\n"
+        # 🔥 TITLE BOOST
+        prefix = f"""
+Slide Title: {meta.get('slide_title', '')}
+Title: {meta.get('slide_title', '')}
+"""
 
         if len(text) <= chunk_size:
             meta["chunk_id"] = 0
-            meta["chunk_uid"] = generate_chunk_id(
+            meta["chunk_uid"] = chunk_id(
                 meta["file_name"], meta["slide_number"], 0, meta["version"]
             )
 
-            chunked_docs.append(
-                Document(page_content=context_prefix + text, metadata=meta)
+            final_docs.append(
+                Document(page_content=prefix + text, metadata=meta)
             )
             continue
 
         chunks = splitter.split_text(text)
 
         for idx, chunk in enumerate(chunks):
-            chunk = chunk.strip()
-            if not chunk:
+            if not chunk.strip():
                 continue
 
             meta_copy = meta.copy()
             meta_copy["chunk_id"] = idx
-            meta_copy["chunk_uid"] = generate_chunk_id(
+            meta_copy["chunk_uid"] = chunk_id(
                 meta["file_name"], meta["slide_number"], idx, meta["version"]
             )
 
-            chunked_docs.append(
-                Document(page_content=context_prefix + chunk, metadata=meta_copy)
+            final_docs.append(
+                Document(page_content=prefix + chunk, metadata=meta_copy)
             )
 
-    return chunked_docs
+    return final_docs
 
 
 # =========================
-# ✅ EMBEDDING MODEL
+# ✅ EMBEDDING
 # =========================
 def get_embedding():
     return AzureOpenAIEmbeddings(
@@ -176,20 +176,55 @@ def get_vector_store(embedding):
 # =========================
 # ✅ UPSERT
 # =========================
-def upsert_documents(vector_store, docs, batch_size=50):
-    texts, metas, ids = [], [], []
+def upsert(vs, docs):
+    texts = [d.page_content for d in docs]
+    metas = [d.metadata for d in docs]
+    ids = [d.metadata["chunk_uid"] for d in docs]
 
-    for d in docs:
-        texts.append(d.page_content)
-        metas.append(d.metadata)
-        ids.append(d.metadata["chunk_uid"])
+    vs.add_texts(texts=texts, metadatas=metas, ids=ids)
 
-    for i in range(0, len(texts), batch_size):
-        vector_store.add_texts(
-            texts=texts[i:i+batch_size],
-            metadatas=metas[i:i+batch_size],
-            ids=ids[i:i+batch_size]
-        )
+
+# =========================
+# ✅ TITLE-AWARE RETRIEVAL
+# =========================
+def retrieve(vs, query, k=5):
+
+    # Semantic
+    docs = vs.similarity_search(query, k=k)
+
+    # Title match (🔥 critical)
+    all_data = vs.get()
+    title_docs = []
+
+    for content, meta in zip(all_data["documents"], all_data["metadatas"]):
+        title = (meta.get("slide_title") or "").lower()
+
+        if any(word in title for word in query.lower().split()):
+            title_docs.append(
+                Document(page_content=content, metadata=meta)
+            )
+
+    # Merge + dedupe
+    seen = set()
+    final = []
+
+    for d in title_docs + docs:
+        uid = d.metadata["chunk_uid"]
+        if uid not in seen:
+            seen.add(uid)
+            final.append(d)
+
+    return final[:k]
+
+
+# =========================
+# ✅ CONTEXT
+# =========================
+def build_context(docs):
+    return "\n\n".join([
+        f"Slide {d.metadata['slide_number']}:\n{d.page_content}"
+        for d in docs
+    ])
 
 
 # =========================
@@ -206,36 +241,21 @@ def get_llm():
 
 
 # =========================
-# ✅ RETRIEVE
-# =========================
-def retrieve(vector_store, query, k=5, filters=None):
-    return vector_store.similarity_search(query, k=k, filter=filters)
-
-
-# =========================
-# ✅ CONTEXT BUILDER
-# =========================
-def build_context(docs):
-    return "\n\n".join([
-        f"Source: {d.metadata['source']}\n{d.page_content}"
-        for d in docs
-    ])
-
-
-# =========================
 # ✅ QA
 # =========================
-def answer(query, vector_store, llm, filters=None):
-    docs = retrieve(vector_store, query, filters=filters)
+def answer(query, vs, llm):
+
+    docs = retrieve(vs, query, k=8)
 
     if not docs:
-        return "No relevant data found."
+        return "No data found."
 
     context = build_context(docs)
 
     prompt = f"""
-Answer using ONLY the context below.
-If not found, say "I don't know".
+Extract ALL comments or bullet points from the context.
+
+Return ONLY as bullet list.
 
 Context:
 {context}
@@ -251,29 +271,31 @@ Question:
 # ✅ MAIN
 # =========================
 if __name__ == "__main__":
+
     ppt_file = "input.pptx"
 
-    # 1. Extraction
-    raw_docs = extract_ppt(ppt_file)
+    # 1. Ingest
+    raw = extract_ppt(ppt_file)
 
     # 2. Convert
-    lc_docs = to_langchain_docs(raw_docs)
+    docs = to_docs(raw)
 
     # 3. Chunk
-    chunked_docs = chunk_documents(lc_docs)
+    chunks = chunk_documents(docs)
 
-    # 4. Embed + Store
-    embedding = get_embedding()
-    vector_store = get_vector_store(embedding)
-    upsert_documents(vector_store, chunked_docs)
+    # 4. Embed
+    emb = get_embedding()
+    vs = get_vector_store(emb)
+    upsert(vs, chunks)
 
-    print("✅ Ingestion + Embedding Done")
+    print("✅ Pipeline Ready")
 
     # 5. Query
     llm = get_llm()
 
-    query = "What is the revenue trend?"
-    result = answer(query, vector_store, llm)
+    q = "What are the comments in G&A Evaluation - MTD vs FC7+5"
+
+    res = answer(q, vs, llm)
 
     print("\n=== ANSWER ===\n")
-    print(result)
+    print(res)
