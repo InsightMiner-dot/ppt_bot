@@ -166,12 +166,11 @@ def format_chat_history(messages):
 
 
 def stream_text(text):
-    for chunk in text.split(" "):
+    for chunk in text.split():
         yield chunk + " "
         time.sleep(0.02)
 
 
-# --- Session State Initialization ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -185,7 +184,6 @@ if "skipped_files" not in st.session_state:
     st.session_state.skipped_files = []
 
 
-# --- Page Config & UI Layout ---
 st.set_page_config(page_title="Multi-file Chatbot", layout="wide")
 st.title("Multi-file Chatbot")
 st.caption("Upload files from the sidebar, then chat with your documents.")
@@ -244,50 +242,44 @@ with st.sidebar:
         st.session_state.skipped_files = []
 
 
-# --- Main Chat Interface ---
-
-# 1. Display existing chat messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        st.write(message["content"])
 
-# 2. Handle new user input
-if user_question := st.chat_input("Ask a question about the uploaded files"):
-    
-    # Display and save user message
-    with st.chat_message("user"):
-        st.markdown(user_question)
+
+user_question = st.chat_input("Ask a question about the uploaded files")
+
+if user_question:
     st.session_state.messages.append({"role": "user", "content": user_question})
 
-    # Generate and display assistant response
+    with st.chat_message("user"):
+        st.write(user_question)
+
     with st.chat_message("assistant"):
-        if not st.session_state.context:
-            error_msg = "Please upload and process files from the sidebar first."
-            st.warning(error_msg)
-            st.session_state.messages.append({"role": "assistant", "content": error_msg})
-        else:
+        with st.status("Generating answer...", expanded=True) as status:
             try:
-                # Simple spinner blocks the UI cleanly while LLM generates the full answer
-                with st.spinner("Searching documents and generating answer..."):
+                if not st.session_state.context:
+                    answer = "Please upload and process files from the sidebar first."
+                else:
+                    status.write("Preparing chat history...")
                     chat_history = format_chat_history(st.session_state.messages[:-1])
-                    
+                    status.write("Calling Azure OpenAI...")
                     answer = ask_llm(
                         st.session_state.context,
                         user_question,
                         chat_history,
                     )
-                
-                # Stream the final text directly into the chat bubble
+                    status.write("Streaming response...")
+
                 streamed_answer = st.write_stream(stream_text(answer))
-                
-                # Save assistant response to state
                 st.session_state.messages.append(
                     {"role": "assistant", "content": streamed_answer}
                 )
-                
+                status.update(label="Answer ready", state="complete", expanded=False)
             except Exception as exc:
-                error_message = f"An error occurred: {str(exc)}"
+                error_message = str(exc)
                 st.error(error_message)
                 st.session_state.messages.append(
                     {"role": "assistant", "content": error_message}
                 )
+                status.update(label="Request failed", state="error", expanded=True)
