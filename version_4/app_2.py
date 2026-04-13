@@ -1,6 +1,5 @@
 import os
 import tempfile
-import time
 from pathlib import Path
 
 import streamlit as st
@@ -20,16 +19,7 @@ from langchain_openai import AzureChatOpenAI
 
 load_dotenv(override=True)
 
-SUPPORTED_EXTENSIONS = {
-    ".pptx",
-    ".ppt",
-    ".pdf",
-    ".docx",
-    ".doc",
-    ".txt",
-    ".md",
-    ".csv",
-}
+SUPPORTED_EXTENSIONS = ["pptx", "ppt", "pdf", "docx", "doc", "txt", "md", "csv"]
 
 
 def get_required_env(name):
@@ -39,7 +29,7 @@ def get_required_env(name):
     return value
 
 
-def build_chain():
+def get_chain():
     llm = AzureChatOpenAI(
         openai_api_version=get_required_env("AZURE_OPENAI_API_VERSION"),
         model=get_required_env("MODEL_NAME"),
@@ -51,148 +41,123 @@ def build_chain():
     )
 
     system_prompt = SystemMessagePromptTemplate.from_template(
-        "You are a helpful AI assistant who answers user questions using only the provided context."
+        "You are a helpful document chatbot. Answer only from the provided context."
     )
-
     human_prompt = HumanMessagePromptTemplate.from_template(
-        """Answer the user question based only on the provided context.
-If the answer is not in the context, say "I don't know".
-If multiple files are uploaded, compare them when needed.
+        """Answer the user's question using only the context below.
+If the answer is not available in the context, say "I don't know".
 
-### Context:
+Context:
 {context}
 
-### Chat History:
-{chat_history}
-
-### Question:
+Question:
 {question}
 
-IMPORTANT:
-At the end of the answer, include a "References" section with Source, Filename, Last Modified, and Page Number.
-
-### Answer:"""
+At the end, add a short "References" section with the file name and page number you used.
+"""
     )
 
     prompt = ChatPromptTemplate.from_messages([system_prompt, human_prompt])
     return prompt | llm | StrOutputParser()
 
 
-def ask_llm(context, question, chat_history):
-    chain = build_chain()
-    return chain.invoke(
-        {
-            "context": context,
-            "question": question,
-            "chat_history": chat_history,
-        }
-    )
-
-
-def save_uploaded_file(uploaded_file, directory):
-    file_path = Path(directory) / uploaded_file.name
-    file_path.write_bytes(uploaded_file.getbuffer())
-    return file_path
-
-
 def get_loader(file_path):
-    extension = file_path.suffix.lower()
-    if extension in {".pptx", ".ppt"}:
+    suffix = file_path.suffix.lower()
+    if suffix in {".pptx", ".ppt"}:
         return UnstructuredPowerPointLoader(str(file_path), mode="elements")
     return UnstructuredFileLoader(str(file_path), mode="elements")
 
 
 def build_context(uploaded_files):
     context_parts = []
-    added_files = []
+    loaded_files = []
     skipped_files = []
 
     with tempfile.TemporaryDirectory() as temp_dir:
         for uploaded_file in uploaded_files:
-            extension = Path(uploaded_file.name).suffix.lower()
-            if extension not in SUPPORTED_EXTENSIONS:
-                skipped_files.append(uploaded_file.name)
-                continue
-
-            file_path = save_uploaded_file(uploaded_file, temp_dir)
+            file_path = Path(temp_dir) / uploaded_file.name
+            file_path.write_bytes(uploaded_file.getbuffer())
 
             try:
-                loader = get_loader(file_path)
-                docs = loader.load()
+                docs = get_loader(file_path).load()
             except Exception as exc:
                 skipped_files.append(f"{uploaded_file.name} ({exc})")
                 continue
 
-            has_content = False
+            has_text = False
             for index, doc in enumerate(docs, start=1):
-                metadata = dict(doc.metadata or {})
+                content = (doc.page_content or "").strip()
+                if not content:
+                    continue
+
+                has_text = True
+                metadata = doc.metadata or {}
                 page_number = (
                     metadata.get("page_number")
                     or metadata.get("page")
                     or metadata.get("page_index")
                     or index
                 )
-                source = metadata.get("source", str(file_path))
-                last_modified = metadata.get("last_modified", "Unknown Date")
                 filename = metadata.get("filename", uploaded_file.name)
-                content = (doc.page_content or "").strip()
-
-                if not content:
-                    continue
-
-                has_content = True
-                reference = (
-                    f"Source: {source}, Filename: {filename}, "
-                    f"Last Modified: {last_modified}, Page Number: {page_number}"
-                )
                 context_parts.append(
-                    f"## File: {filename} | Page: {page_number}\n"
-                    f"[Reference Metadata -> {reference}]\n"
-                    f"{content}"
+                    f"File: {filename}\nPage: {page_number}\nContent:\n{content}"
                 )
 
-            if has_content:
-                added_files.append(uploaded_file.name)
+            if has_text:
+                loaded_files.append(uploaded_file.name)
+            else:
+                skipped_files.append(f"{uploaded_file.name} (no readable text found)")
 
-    return "\n\n".join(context_parts), added_files, skipped_files
-
-
-def format_chat_history(messages):
-    history_lines = []
-    for message in messages:
-        role = "User" if message["role"] == "user" else "Assistant"
-        history_lines.append(f"{role}: {message['content']}")
-    return "\n".join(history_lines)
+    return "\n\n".join(context_parts), loaded_files, skipped_files
 
 
-def stream_text(text):
-    for chunk in text.split():
-        yield chunk + " "
-        time.sleep(0.02)
+def ask_question(question):
+    chain = get_chain()
+    return chain.invoke(
+        {
+            "context": st.session_state.context,
+            "question": question,
+        }
+    )
+
+
+def handle_user_question(question):
+    st.session_state.messages.append({"role": "user", "content": question})
+
+    if not st.session_state.context:
+        answer = "Please upload and process files first."
+    else:
+        answer = ask_question(question)
+
+    st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.session_state.messages = [
+        {
+            "role": "assistant",
+            "content": "Upload documents from the sidebar and ask me anything about them.",
+        }
+    ]
 
 if "context" not in st.session_state:
     st.session_state.context = ""
 
-if "uploaded_names" not in st.session_state:
-    st.session_state.uploaded_names = []
+if "loaded_files" not in st.session_state:
+    st.session_state.loaded_files = []
 
 if "skipped_files" not in st.session_state:
     st.session_state.skipped_files = []
 
 
-st.set_page_config(page_title="Multi-file Chatbot", layout="wide")
-st.title("Multi-file Chatbot")
-st.caption("Upload files from the sidebar, then chat with your documents.")
+st.set_page_config(page_title="Document Chatbot", layout="wide")
+st.title("Document Chatbot")
 
 with st.sidebar:
-    st.subheader("File uploader")
+    st.subheader("Upload Files")
     uploaded_files = st.file_uploader(
-        "Upload one or more files",
-        type=[ext.lstrip(".") for ext in SUPPORTED_EXTENSIONS],
+        "Choose files",
+        type=SUPPORTED_EXTENSIONS,
         accept_multiple_files=True,
     )
 
@@ -200,86 +165,50 @@ with st.sidebar:
         if not uploaded_files:
             st.warning("Please upload at least one file.")
         else:
-            with st.status("Processing uploaded files...", expanded=True) as status:
-                context, added_files, skipped_files = build_context(uploaded_files)
+            with st.spinner("Processing files..."):
+                context, loaded_files, skipped_files = build_context(uploaded_files)
 
-                if not context.strip():
-                    status.update(
-                        label="No readable content found",
-                        state="error",
-                        expanded=True,
-                    )
-                    st.error("No readable content was found in the uploaded files.")
-                else:
-                    st.session_state.context = context
-                    st.session_state.uploaded_names = added_files
-                    st.session_state.skipped_files = skipped_files
-                    st.session_state.messages = []
-                    status.write(f"Processed {len(added_files)} file(s).")
-                    if skipped_files:
-                        status.write(f"Skipped {len(skipped_files)} file(s).")
-                    status.update(label="Files ready", state="complete", expanded=False)
+            if not context:
+                st.error("No readable content found in the uploaded files.")
+            else:
+                st.session_state.context = context
+                st.session_state.loaded_files = loaded_files
+                st.session_state.skipped_files = skipped_files
+                st.session_state.messages = [
+                    {
+                        "role": "assistant",
+                        "content": "Files are ready. Ask me questions about your documents.",
+                    }
+                ]
+                st.success(f"Processed {len(loaded_files)} file(s).")
 
-    st.subheader("Loaded files")
-    if st.session_state.uploaded_names:
-        for name in st.session_state.uploaded_names:
+    if st.session_state.loaded_files:
+        st.subheader("Loaded")
+        for name in st.session_state.loaded_files:
             st.write(f"- {name}")
-    else:
-        st.write("No files processed yet.")
 
     if st.session_state.skipped_files:
-        st.subheader("Skipped files")
-        for skipped_file in st.session_state.skipped_files:
-            st.write(f"- {skipped_file}")
+        st.subheader("Skipped")
+        for name in st.session_state.skipped_files:
+            st.write(f"- {name}")
 
     if st.button("Clear Chat"):
-        st.session_state.messages = []
+        st.session_state.messages = [
+            {
+                "role": "assistant",
+                "content": "Chat cleared. Ask a new question whenever you're ready.",
+            }
+        ]
 
-    if st.button("Reset All"):
-        st.session_state.messages = []
-        st.session_state.context = ""
-        st.session_state.uploaded_names = []
-        st.session_state.skipped_files = []
+
+question = st.chat_input("Ask a question about your files")
+
+if question:
+    with st.spinner("Thinking..."):
+        handle_user_question(question)
+    st.rerun()
 
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.write(message["content"])
-
-
-user_question = st.chat_input("Ask a question about the uploaded files")
-
-if user_question:
-    st.session_state.messages.append({"role": "user", "content": user_question})
-
-    with st.chat_message("user"):
-        st.write(user_question)
-
-    with st.chat_message("assistant"):
-        with st.status("Generating answer...", expanded=True) as status:
-            try:
-                if not st.session_state.context:
-                    answer = "Please upload and process files from the sidebar first."
-                else:
-                    status.write("Preparing chat history...")
-                    chat_history = format_chat_history(st.session_state.messages[:-1])
-                    status.write("Calling Azure OpenAI...")
-                    answer = ask_llm(
-                        st.session_state.context,
-                        user_question,
-                        chat_history,
-                    )
-                    status.write("Streaming response...")
-
-                streamed_answer = st.write_stream(stream_text(answer))
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": streamed_answer}
-                )
-                status.update(label="Answer ready", state="complete", expanded=False)
-            except Exception as exc:
-                error_message = str(exc)
-                st.error(error_message)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": error_message}
-                )
-                status.update(label="Request failed", state="error", expanded=True)
+        st.markdown(message["content"])
