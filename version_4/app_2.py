@@ -166,11 +166,12 @@ def format_chat_history(messages):
 
 
 def stream_text(text):
-    for chunk in text.split():
+    for chunk in text.split(" "):
         yield chunk + " "
         time.sleep(0.02)
 
 
+# --- Session State Initialization ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -183,23 +184,50 @@ if "uploaded_names" not in st.session_state:
 if "skipped_files" not in st.session_state:
     st.session_state.skipped_files = []
 
-if "pending_files" not in st.session_state:
-    st.session_state.pending_files = []
 
-
+# --- Page Config & UI Layout ---
 st.set_page_config(page_title="Multi-file Chatbot", layout="wide")
 st.title("Multi-file Chatbot")
-st.caption("A chatbot-style document assistant with custom chat controls.")
+st.caption("Upload files from the sidebar, then chat with your documents.")
 
 with st.sidebar:
-    st.subheader("Documents")
-    pending_files = st.multiselect(
-        "Selected files",
-        options=st.session_state.uploaded_names,
-        default=st.session_state.uploaded_names,
-        disabled=True,
+    st.subheader("File uploader")
+    uploaded_files = st.file_uploader(
+        "Upload one or more files",
+        type=[ext.lstrip(".") for ext in SUPPORTED_EXTENSIONS],
+        accept_multiple_files=True,
     )
-    st.write(f"Loaded: {len(pending_files)}")
+
+    if st.button("Process Files", type="primary"):
+        if not uploaded_files:
+            st.warning("Please upload at least one file.")
+        else:
+            with st.status("Processing uploaded files...", expanded=True) as status:
+                context, added_files, skipped_files = build_context(uploaded_files)
+
+                if not context.strip():
+                    status.update(
+                        label="No readable content found",
+                        state="error",
+                        expanded=True,
+                    )
+                    st.error("No readable content was found in the uploaded files.")
+                else:
+                    st.session_state.context = context
+                    st.session_state.uploaded_names = added_files
+                    st.session_state.skipped_files = skipped_files
+                    st.session_state.messages = []
+                    status.write(f"Processed {len(added_files)} file(s).")
+                    if skipped_files:
+                        status.write(f"Skipped {len(skipped_files)} file(s).")
+                    status.update(label="Files ready", state="complete", expanded=False)
+
+    st.subheader("Loaded files")
+    if st.session_state.uploaded_names:
+        for name in st.session_state.uploaded_names:
+            st.write(f"- {name}")
+    else:
+        st.write("No files processed yet.")
 
     if st.session_state.skipped_files:
         st.subheader("Skipped files")
@@ -214,87 +242,52 @@ with st.sidebar:
         st.session_state.context = ""
         st.session_state.uploaded_names = []
         st.session_state.skipped_files = []
-        st.session_state.pending_files = []
 
 
+# --- Main Chat Interface ---
+
+# 1. Display existing chat messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.write(message["content"])
+        st.markdown(message["content"])
 
-
-with st.container():
-    with st.form("chatbot_form", clear_on_submit=True):
-        uploaded_files = st.file_uploader(
-            "Attach files",
-            type=[ext.lstrip(".") for ext in SUPPORTED_EXTENSIONS],
-            accept_multiple_files=True,
-            label_visibility="collapsed",
-        )
-        user_question = st.text_area(
-            "Type your message",
-            placeholder="Ask a question about your files...",
-            height=100,
-            label_visibility="collapsed",
-        )
-        submitted = st.form_submit_button("Send")
-
-
-if submitted:
-    user_parts = []
-    if user_question.strip():
-        user_parts.append(user_question.strip())
-    if uploaded_files:
-        user_parts.append(
-            "Attached files: " + ", ".join(uploaded_file.name for uploaded_file in uploaded_files)
-        )
-
-    user_message = "\n".join(user_parts) if user_parts else "Uploaded file(s)"
-    st.session_state.messages.append({"role": "user", "content": user_message})
-
+# 2. Handle new user input
+if user_question := st.chat_input("Ask a question about the uploaded files"):
+    
+    # Display and save user message
     with st.chat_message("user"):
-        st.write(user_message)
+        st.markdown(user_question)
+    st.session_state.messages.append({"role": "user", "content": user_question})
 
+    # Generate and display assistant response
     with st.chat_message("assistant"):
-        with st.status("Working on your request...", expanded=True) as status:
+        if not st.session_state.context:
+            error_msg = "Please upload and process files from the sidebar first."
+            st.warning(error_msg)
+            st.session_state.messages.append({"role": "assistant", "content": error_msg})
+        else:
             try:
-                if uploaded_files:
-                    status.write(f"Processing {len(uploaded_files)} file(s)...")
-                    new_context, added_files, skipped_files = build_context(uploaded_files)
-                    if new_context:
-                        if st.session_state.context:
-                            st.session_state.context += "\n\n" + new_context
-                        else:
-                            st.session_state.context = new_context
-                        for added_file in added_files:
-                            if added_file not in st.session_state.uploaded_names:
-                                st.session_state.uploaded_names.append(added_file)
-                    st.session_state.skipped_files.extend(skipped_files)
-                    status.write("Files processed.")
-
-                if not st.session_state.context:
-                    answer = "Please attach at least one supported file so I can answer from its content."
-                elif not user_question.strip():
-                    answer = "Your files are ready. Ask me a question about the uploaded content."
-                else:
-                    status.write("Preparing chat history...")
+                # Simple spinner blocks the UI cleanly while LLM generates the full answer
+                with st.spinner("Searching documents and generating answer..."):
                     chat_history = format_chat_history(st.session_state.messages[:-1])
-                    status.write("Calling Azure OpenAI...")
+                    
                     answer = ask_llm(
                         st.session_state.context,
-                        user_question.strip(),
+                        user_question,
                         chat_history,
                     )
-                    status.write("Streaming response...")
-
+                
+                # Stream the final text directly into the chat bubble
                 streamed_answer = st.write_stream(stream_text(answer))
+                
+                # Save assistant response to state
                 st.session_state.messages.append(
                     {"role": "assistant", "content": streamed_answer}
                 )
-                status.update(label="Done", state="complete", expanded=False)
+                
             except Exception as exc:
-                error_message = str(exc)
+                error_message = f"An error occurred: {str(exc)}"
                 st.error(error_message)
                 st.session_state.messages.append(
                     {"role": "assistant", "content": error_message}
                 )
-                status.update(label="Failed", state="error", expanded=True)
